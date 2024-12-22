@@ -5,3 +5,7 @@ version = 3
 [[package]]
 name = "chip_8_core"
 version = "0.1.0"
+
+[[package]]
+name = "frontend"
+version = "0.1.0"

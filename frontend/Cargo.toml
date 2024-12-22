@@ -1,6 +1,5 @@
-workspace = { members = ["frontend"] }
 [package]
-name = "chip_8_core"
+name = "frontend"
 version = "0.1.0"
 edition = "2021"
 
