@@ -1,4 +1,6 @@
-use std::collections::VecDeque;
+use core::panicking::panic;
+use std::{collections::VecDeque, os::unix::process};
+use rand::random;
 
 pub const SCREEN_WIDTH: usize = 64;
 pub const SCREEN_HEIGHT: usize = 32;
@@ -28,6 +30,15 @@ const FONTSET: [u8; FONTSET_SIZE] = [
     0xF0, 0x80, 0xF0, 0x80, 0xF0, //E
     0xF0, 0x80, 0xF0, 0x80, 0x80, //F
 ];
+
+macro_rules! gen_binop {
+    ($name:ident, $op:tt) => {
+        fn $name(&mut self, d2: u16, d3: u16) {
+            let (x, y) = dd_as_xy(d2, d3);
+            self.vregs[x] $op self.vregs[y];
+        }
+    };
+}
 
 pub struct Emu {
     pc: u16,
@@ -91,74 +102,231 @@ impl Emu {
             (2, _, _, _) => self.call_subroutine(op),
             (3, _, _, _) => self.skip_next_if_vx_eq_nn(op, d2),
             (4, _, _, _) => self.skip_next_if_vx_neq_nn(op, d2),
-            (5, _, _, _) => self.skip_next_if_vx_eq_vy(d2, d3),
+            (5, _, _, 0) => self.skip_next_if_vx_eq_vy(d2, d3),
             (6, _, _, _) => self.set_vx_as_nn(op, d2),
             (7, _, _, _) => self.inc_vx_with_nn(op, d2),
             (8, _, _, 0) => self.set_vx_as_vy(op, d2),
             (8, _, _, 1) => self.vx_binor_vy(d2, d3),
             (8, _, _, 2) => self.vx_binand_vy(d2, d3),
             (8, _, _, 3) => self.vx_binxor_vy(d2, d3),
+            (8, _, _, 4) => self.inc_vx_with_vy(d2, d3),
+            (8, _, _, 5) => self.dec_vx_with_vy(d2, d3),
+            (8, _, _, 6) => self.r_bitshift_vx(d2),
+            (8, _, _, 7) => self.set_vx_to_vy_sub_vx(d2, d3),
+            (8, _, _, 0xE) => self.l_bitshift_vx(d2),
+            (9, _, _, 0) => self.skip_next_if_vx_neq_vy(d2, d3),
+            (0xA, _, _, _) => self.set_ireg_as_nnn(op),
+            (0xB, _, _, _) => self.jump_to_v0_plus_nnn(op),
+            (0xC, _, _, _) => self.set_vx_as_rand_and_nn(op, d2),
+            (0xD, _, _, _) => self.draw_sprite(d2, d3, d4),
+            (0xE, _, 9, 0xE) => self.skip_next_if_key_pressed(d2),
+            (0xE, _, 0xA, 1) => self.skip_next_if_not_key_pressed(d2),
+            (0xF, _, 0, 7) => self.set_vx_as_dt(d2),
+            (0xF, _, 0, 0xA) => self.wait_for_key_press(d2),
+            (0xF, _, 1, 5) => self.set_dt_as_vx(d2),
+            (0xF, _, 1, 8) => self.set_st_as_vx(d2),
+            (0xF, _, 1, 0xE) => self.inc_ireg_by_vx(d2),
+            (0xF, _, 2, 9) => self.set_ireg_to_font_addr(d2),
+            (0xF, _, 3, 3) => self.set_ireg_to_bcd_of_vx(d2),
+            (0xF, _, 5, 5) => self.load_v0_to_vx_into_ram(d2),
+            (0xF, _, 6, 5) => self.load_v0_to_vx_into_ram(d2),
 
             (_,_,_,_) => unimplemented!("rip chip-8, found unimplemented op code: {}", op)
         }
     }
 
-    fn vx_binor_vy(&mut self, d2: u16, d3: u16) {
+    fn load_ram_into_v0_to_vx(&mut self, d2: u16) {
         let x = d2 as usize;
-        let y = d3 as usize;
-        self.vregs[x] |= self.vregs[y];
+        let i = self.ireg as usize;
+        for idx in 0..=x {
+            if idx>V_REGISTER_COUNT {
+                panic!("rip chip-8, ram to vx copy went out of bounds");
+            } else {
+                self.vregs[idx] = self.ram[i + idx];
+            }
+        }
     }
 
-    fn vx_binand_vy(&mut self, d2: u16, d3: u16) {
+    fn load_v0_to_vx_into_ram(&mut self, d2: u16) {
         let x = d2 as usize;
-        let y = d3 as usize;
-        self.vregs[x] &= self.vregs[y];
+        let i = self.ireg as usize;
+        for idx in 0..=x {
+            if idx>V_REGISTER_COUNT {
+                panic!("rip chip-8, vx to ram copy went out of bounds");
+            } else {
+                self.ram[i + idx] = self.vregs[idx];
+            }
+        }
     }
 
-    fn vx_binxor_vy(&mut self, d2: u16, d3: u16) {
-        let x = d2 as usize;
-        let y = d3 as usize;
-        self.vregs[x] ^= self.vregs[y];
+    fn set_ireg_to_bcd_of_vx(&mut self, d2: u16) {
+        let vx = self.vregs[d2 as usize];
+        self.ram[self.ireg as usize] = grab_base_10_digit(vx, 2);
+        self.ram[(self.ireg + 1) as usize] = grab_base_10_digit(vx, 1);
+        self.ram[(self.ireg + 2) as usize] = grab_base_10_digit(vx, 0);
     }
+
+    fn set_ireg_to_font_addr(&mut self, d2: u16) {
+        self.ireg = self.vregs[d2 as usize] as u16 * 5;
+    }
+
+    fn inc_ireg_by_vx(&mut self, d2: u16) {
+        self.ireg = self.ireg.wrapping_add(self.vregs[d2 as usize] as u16);
+    }
+
+    fn set_st_as_vx(&mut self, d2: u16) {
+        self.st = self.vregs[d2 as usize];
+    }
+
+    fn set_dt_as_vx(&mut self, d2: u16) {
+        self.dt = self.vregs[d2 as usize];
+    }
+
+    fn wait_for_key_press(&mut self, d2: u16) {
+        let search_result = self.keys.into_iter().enumerate().find(|(_,key)| {
+            *key
+        });
+
+        if let Some((idx, _)) = search_result{
+            self.vregs[d2 as usize] = idx as u8;
+        } else {
+            self.pc -= 2;
+        }
+    }
+
+    fn set_vx_as_dt(&mut self, d2: u16) {
+        self.vregs[d2 as usize] = self.dt;
+    }
+
+    fn skip_next_if_not_key_pressed(&mut self, d2: u16) {
+        self.skip_if(!self.keys[self.vregs[d2 as usize] as usize]);
+    }
+
+    fn skip_next_if_key_pressed(&mut self, d2: u16) {
+        self.skip_if(self.keys[self.vregs[d2 as usize] as usize]);
+    }
+
+    fn draw_sprite(&mut self, d2: u16, d3: u16, d4: u16) {
+        let (x, y) = dd_as_xy(d2, d3);
+        let d4 = d4 as usize;
+        let mut flipped = false;
+
+        for y_line in 0..d4 {
+            let pixels = self.ram[self.ireg as usize + y_line];
+            for x_line in 0..8 {
+                if (pixels & (0b1000_0000 >> x_line)) != 0 {
+                    let x = (x + x_line) % SCREEN_WIDTH;
+                    let y = (y + y_line) % SCREEN_HEIGHT;
+
+                    let idx = x + SCREEN_WIDTH * y;
+
+                    flipped |= self.screen[idx];
+                    self.screen[idx] ^= true;
+                }
+            }
+        }
+
+        self.map_vreg_0xf(flipped);
+    }
+
+    fn set_vx_as_rand_and_nn(&mut self, op: u16, d2: u16) {
+        let (nn, x) = op_d_as_nn_x(op, d2);
+        self.vregs[x] = random::<u8>() & nn;
+    }
+
+    fn jump_to_v0_plus_nnn(&mut self, op: u16) {
+        self.pc = (self.vregs[0] as u16) + (op & 0xFFF);
+    }
+
+    fn set_ireg_as_nnn(&mut self, op: u16) {
+        self.ireg = op & 0xFFF;
+    }
+
+    fn skip_next_if_vx_neq_vy(&mut self, d2: u16, d3: u16) {
+        let (x, y) = dd_as_xy(d2, d3);
+        self.skip_if(self.vregs[x]!=self.vregs[y]);
+    }
+
+    fn l_bitshift_vx(&mut self, d2: u16) {
+        let x = d2 as usize;
+        self.vregs[0xF] = (self.vregs[x] >> 7) & 1; //dropped bit flag
+        self.vregs[x] <<= 1;
+    }
+
+    fn set_vx_to_vy_sub_vx(&mut self, d2: u16, d3: u16) {
+        let (x, y) = dd_as_xy(d2, d3);
+        let (val, overflow) = self.vregs[y].overflowing_sub(self.vregs[x]);
+        self.handle_overflow(x, val, !overflow); //invert flag for subtraction
+    }
+
+    fn r_bitshift_vx(&mut self, d2: u16) {
+        let x = d2 as usize;
+        self.vregs[0xF] = self.vregs[x] & 1; // dropped bit flag
+        self.vregs[x] >>= 1;
+    }
+
+    fn dec_vx_with_vy(&mut self, d2: u16, d3: u16) {
+        let (x, y) = dd_as_xy(d2, d3);
+        let (val, overflow) = self.vregs[x].overflowing_sub(self.vregs[y]);
+        self.handle_overflow(x, val, !overflow); //invert flag for subtraction
+    }
+
+    fn inc_vx_with_vy(&mut self, d2: u16, d3: u16) {
+        let (x, y) = dd_as_xy(d2, d3);
+        let (val, overflow) = self.vregs[x].overflowing_add(self.vregs[y]);
+        self.handle_overflow(x, val, overflow);
+    }
+
+
+    fn handle_overflow(&mut self, x: usize, val: u8, overflow: bool) {
+        self.map_vreg_0xf(overflow);
+        self.vregs[x] = val;
+    }
+
+    fn map_vreg_0xf(&mut self, condition: bool) {
+        if condition{
+            self.vregs[0xF] = 1;
+        } else {
+            self.vregs[0xF] = 0;
+        }
+    }
+
+    gen_binop!(vx_binor_vy, |=);
+    gen_binop!(vx_binand_vy, &=);
+    gen_binop!(vx_binxor_vy, ^=);
 
     fn set_vx_as_vy(&mut self, d2: u16, d3: u16) {
-        let x = d2 as usize;
-        let y = d3 as usize;
+        let (x, y) = dd_as_xy(d2, d3);
         self.vregs[x] = self.vregs[y];
     }
 
     fn inc_vx_with_nn(&mut self, op: u16, d2: u16) {
-        let x = d2 as usize;
-        let nn = (op & 0xFF) as u8;
+        let (nn, x) = op_d_as_nn_x(op, d2);
         self.vregs[x] += nn;
     }
 
     fn set_vx_as_nn(&mut self, op: u16, d2: u16) {
-        let x = d2 as usize;
-        let nn = (op & 0xFF) as u8;
+        let (nn, x) = op_d_as_nn_x(op, d2);
         self.vregs[x] = nn;
     }
 
     fn skip_next_if_vx_eq_vy(&mut self, d2: u16, d3: u16) {
-        let x = d2 as usize;
-        let y = d3 as usize;
-        if self.vregs[x]==self.vregs[y] {
-            self.pc += 2;
-        }
+        let (x, y) = dd_as_xy(d2, d3);
+        self.skip_if(self.vregs[x]==self.vregs[y]);
     }
 
     fn skip_next_if_vx_neq_nn(&mut self, op: u16, d2: u16) {
-        let x = d2 as usize;
-        let nn = (op & 0x0FF) as u8;
-        if self.vregs[x]!=nn {
-            self.pc += 2;
-        }
+        let (nn, x) = op_d_as_nn_x(op, d2);
+        self.skip_if(self.vregs[x]!=nn);
     }
 
     fn skip_next_if_vx_eq_nn(&mut self, op: u16, d2: u16) {
-        let x = d2 as usize;
-        let nn = (op & 0x0FF) as u8;
-        if self.vregs[x]==nn {
+        let (nn, x) = op_d_as_nn_x(op, d2);
+        self.skip_if(self.vregs[x]==nn);
+    }
+
+    fn skip_if(&mut self, condition: bool) {
+        if condition {
             self.pc += 2;
         }
     }
@@ -207,4 +375,16 @@ impl Emu {
     fn push(&mut self, val: u16) {
         self.stack.push_front(val);
     }
+}
+
+fn op_d_as_nn_x(op: u16, d: u16) -> (u8, usize) {
+    ((op & 0xFF) as u8, d as usize)
+}
+
+fn dd_as_xy(d2: u16, d3: u16) -> (usize, usize) {
+    (d2 as usize, d3 as usize)
+}
+
+fn grab_base_10_digit(n: u8, i: u8) -> u8{
+    (n / 10_u8.pow(i as u32)) % 10
 }
