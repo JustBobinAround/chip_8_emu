@@ -1,5 +1,4 @@
-use core::panicking::panic;
-use std::{collections::VecDeque, os::unix::process};
+use std::{collections::VecDeque, fs::File, io::Read, os::unix::process};
 use rand::random;
 
 pub const SCREEN_WIDTH: usize = 64;
@@ -42,14 +41,16 @@ macro_rules! gen_binop {
 
 pub struct Emu {
     pc: u16,
-    ram:[u8; RAME_SIZE],
-    screen: [bool; SCREEN_WIDTH * SCREEN_HEIGHT],
+    pub ram:[u8; RAME_SIZE],
+    pub screen: [bool; SCREEN_WIDTH * SCREEN_HEIGHT],
     vregs: [u8; V_REGISTER_COUNT],
-    ireg: u16,
+    pub ireg: u16,
     stack: VecDeque<u16>,
     keys: [bool; NUM_KEYS],
     dt: u8,
     st: u8,
+    input_port: Option<u8>,
+    pub debug: String,
 }
 
 impl Emu {
@@ -63,12 +64,24 @@ impl Emu {
             stack: VecDeque::new(), 
             keys: [false; NUM_KEYS], 
             dt: 0, 
-            st: 0 
+            st: 0,
+            input_port: None,
+            debug: String::new()
         };
 
         emu.ram[..FONTSET_SIZE].copy_from_slice(&FONTSET);
 
         emu
+    }
+
+    pub fn load_rom(&mut self, dir: &String) {
+        if let Ok(mut file) = File::open(dir) {
+            let mut buf = Vec::new();
+            let size = file.read_to_end(&mut buf).expect("oof");
+            self.ram[START_ADDR as usize..size+START_ADDR as usize].copy_from_slice(&buf);
+        } else {
+            println!("oof2");
+        }
     }
 
     pub fn reset(&mut self) {
@@ -82,22 +95,27 @@ impl Emu {
         self.dt = 0; 
         self.st = 0;
         self.ram[..FONTSET_SIZE].copy_from_slice(&FONTSET);
+        self.input_port = None;
     }
 
     pub fn tick(&mut self) {
         let op = self.fetch_op();
+        self.execute(op);
     }
 
-    fn execute(&mut self, op: u16) {
+    pub fn execute(&mut self, op: u16) {
         let d1 = (op & 0xF000) >> 12;
         let d2 = (op & 0x0F00) >> 8;
         let d3 = (op & 0x00F0) >> 4;
         let d4 = op & 0x000F;
+        self.debug.push_str(&format!("\n{} | {:x}, {:x}, {:x}, {:x}", op, d1, d2, d3, d4));
 
+        //println!("{},{},{},{}",d1,d2,d3,d4);
         match (d1,d2,d3,d4) {
             (0, 0, 0, 0) => return,
             (0, 0, 0xE, 0) => self.clear_screen(),
             (0, 0, 0xE, 0xE) => self.return_from_subroutine(),
+            //(0, _, _, _) => self.call_subroutine_no_stack(op),
             (1, _, _, _) => self.jump_to(op),
             (2, _, _, _) => self.call_subroutine(op),
             (3, _, _, _) => self.skip_next_if_vx_eq_nn(op, d2),
@@ -130,11 +148,20 @@ impl Emu {
             (0xF, _, 3, 3) => self.set_ireg_to_bcd_of_vx(d2),
             (0xF, _, 5, 5) => self.load_v0_to_vx_into_ram(d2),
             (0xF, _, 6, 5) => self.load_v0_to_vx_into_ram(d2),
+            //(0xF, _, 0xF, 0xB) => self.input_port_to_vx(d2),
 
-            (_,_,_,_) => unimplemented!("rip chip-8, found unimplemented op code: {}", op)
+            (_,_,_,_) => {
+                panic!("rip chip-8,\n{}\n found unimplemented op code: {}: {:x}, {:x}, {:x}, {:x}",self.debug, op, d1 ,d2 ,d3 ,d4)
+            }
         }
     }
 
+    fn input_port_to_vx(&mut self, d2: u16) {
+        let x = d2 as usize;
+        if let Some(input_port) = self.input_port {
+            self.vregs[x] = input_port;
+        }
+    }
     fn load_ram_into_v0_to_vx(&mut self, d2: u16) {
         let x = d2 as usize;
         let i = self.ireg as usize;
@@ -302,7 +329,8 @@ impl Emu {
 
     fn inc_vx_with_nn(&mut self, op: u16, d2: u16) {
         let (nn, x) = op_d_as_nn_x(op, d2);
-        self.vregs[x] += nn;
+        let (val, overflow ) = self.vregs[x].overflowing_add(nn);
+        self.vregs[x]  = val;
     }
 
     fn set_vx_as_nn(&mut self, op: u16, d2: u16) {
@@ -329,6 +357,10 @@ impl Emu {
         if condition {
             self.pc += 2;
         }
+    }
+
+    fn call_subroutine_no_stack(&mut self, op: u16) {
+        self.pc = op & 0xFFF; // return last 3 bytes to use as memory location
     }
 
     fn call_subroutine(&mut self, op: u16) {
@@ -363,7 +395,7 @@ impl Emu {
 
     pub fn fetch_op(&mut self) -> u16 {
         let first_b = self.ram[self.pc as usize] as u16;
-        let second_b = self.ram[self.pc as usize] as u16;
+        let second_b = self.ram[self.pc as usize+1] as u16;
         self.pc += 2;
         (first_b << 8) | second_b
     }
